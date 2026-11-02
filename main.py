@@ -1,32 +1,42 @@
 """OMNIRO ONLANE - юридическая база (оверлей)."""
+import html
 import json
 import os
+import re
 import shutil
 import sys
+import threading
 import urllib.request
 from pathlib import Path
 
-from PySide6.QtCore import QObject, Qt, Signal
+from PySide6.QtCore import QObject, Qt, QTimer, Signal
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QFrame, QHBoxLayout, QLabel,
-    QLineEdit, QListWidget, QMessageBox, QPushButton, QScrollArea, QSlider,
+    QLineEdit, QMessageBox, QPushButton, QScrollArea, QSizeGrip, QSlider,
     QVBoxLayout, QWidget,
 )
 
 APP_NAME = "OMNIRO ONLANE"
+
+# ===== НАСТРОЙКИ ВЛАДЕЛЬЦА (меняйте перед сборкой) =====
+UPDATE_URL = ""                # ссылка на ваш laws.json на хостинге (https://...)
+# =======================================================
+
 HOTKEYS = ["home", "end", "insert", "delete", "page_up", "page_down"] + [f"f{i}" for i in range(1, 13)]
+SCALES = [0.9, 1.0, 1.15]
 
 DATA_DIR = Path(os.getenv("APPDATA", str(Path.home()))) / APP_NAME
 SETTINGS_FILE = DATA_DIR / "settings.json"
 DB_FILE = DATA_DIR / "laws.json"
 BACKUP_FILE = DATA_DIR / "laws.backup.json"
-DEFAULTS = {"hotkey": "home", "opacity": 95, "on_top": True, "update_url": ""}
+DEFAULTS = {"hotkey": "home", "opacity": 96, "on_top": True, "update_url": "", "scale": 1, "fav": []}
+
+STOP = set("что чем мне мой моя меня будет быть за на в во и или а как по при с со у к от до для не это то ли же бы если можно нельзя".split())
 
 
 def res(rel):
-    base = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
-    return base / rel
+    return Path(getattr(sys, "_MEIPASS", Path(__file__).parent)) / rel
 
 
 def load_json(path, fallback):
@@ -48,11 +58,9 @@ def prepare_data():
     bundled = res("laws.json")
     if not DB_FILE.exists():
         shutil.copy(bundled, DB_FILE)
-    else:
-        # если вышла новая версия программы с более свежей базой - обновляем
-        if ver_tuple(load_json(bundled, {}).get("version")) > ver_tuple(load_json(DB_FILE, {}).get("version")):
-            shutil.copy(DB_FILE, BACKUP_FILE)
-            shutil.copy(bundled, DB_FILE)
+    elif ver_tuple(load_json(bundled, {}).get("version")) > ver_tuple(load_json(DB_FILE, {}).get("version")):
+        shutil.copy(DB_FILE, BACKUP_FILE)
+        shutil.copy(bundled, DB_FILE)
     settings = dict(DEFAULTS)
     settings.update(load_json(SETTINGS_FILE, {}))
     return settings
@@ -62,262 +70,613 @@ def save_settings(s):
     SETTINGS_FILE.write_text(json.dumps(s, ensure_ascii=False, indent=1), encoding="utf-8")
 
 
+def write_db(db):
+    DB_FILE.write_text(json.dumps(db, ensure_ascii=False, indent=1), encoding="utf-8")
+
+
 def validate_db(d):
     if not isinstance(d, dict) or "version" not in d or not isinstance(d.get("sections"), list) or not d["sections"]:
         return False
-    for s in d["sections"]:
-        if not isinstance(s, dict) or "id" not in s or "title" not in s or not isinstance(s.get("items"), list):
-            return False
-        for it in s["items"]:
-            if not isinstance(it, dict) or "id" not in it or "text" not in it:
+    for key in ("sections", "laws"):
+        for s in d.get(key, []):
+            if not isinstance(s, dict) or "id" not in s or "title" not in s or not isinstance(s.get("items"), list):
                 return False
+            for it in s["items"]:
+                if not isinstance(it, dict) or "id" not in it or "text" not in it:
+                    return False
     return True
 
 
-def update_from_url(url):
+def fetch_remote(url):
     req = urllib.request.Request(url, headers={"User-Agent": APP_NAME})
     with urllib.request.urlopen(req, timeout=15) as r:
         data = json.loads(r.read().decode("utf-8"))
     if not validate_db(data):
         raise ValueError("Файл базы имеет неверный формат")
-    if DB_FILE.exists():
-        shutil.copy(DB_FILE, BACKUP_FILE)
-    DB_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
     return data
 
 
+# ---------- поиск ----------
+def stem(w):
+    return w if len(w) <= 3 else w[: max(3, len(w) - 2)]
+
+
+def has(text, tok):
+    return re.search(r"(?<![\wё])" + re.escape(tok), text) is not None
+
+
+def tokens(q):
+    return [stem(w) for w in re.findall(r"[\wё]+", q.lower()) if w not in STOP and len(w) > 1]
+
+
+def flat_items(sections):
+    return [(s, it) for s in sections for it in s["items"]]
+
+
+def search(sections, query):
+    items = flat_items(sections)
+    q = query.strip()
+    if not q:
+        return items
+    if re.fullmatch(r"\d+(\.\d+)*", q):
+        return [(s, it) for s, it in items if it["id"] == q or it["id"].startswith(q + ".")]
+    toks = tokens(q)
+    if not toks:
+        return []
+    need = len(toks) if len(toks) <= 2 else len(toks) - 1
+    scored = []
+    for s, it in items:
+        text = it["text"].lower()
+        rest = " ".join([it.get("punishment", ""), *it.get("notes", [])]).lower()
+        in_text = sum(1 for t in toks if has(text, t))
+        in_rest = sum(1 for t in toks if has(rest, t) and not has(text, t))
+        if in_text + in_rest >= need:
+            scored.append((in_text * 2 + in_rest, s, it))
+    scored.sort(key=lambda x: -x[0])
+    return [(s, it) for _, s, it in scored]
+
+
+def highlight(text, toks):
+    safe = html.escape(text)
+    if not toks:
+        return safe
+    pat = re.compile("(" + "|".join(re.escape(html.escape(t)) + r"[\wё]*" for t in toks) + ")", re.I)
+    return pat.sub(r'<span style="color:#ff8a1f;">\1</span>', safe)
+
+
+def punish_chips(pun):
+    return [c.strip().rstrip(".") for c in re.split(r"\s+или\s+", pun or "") if c.strip()]
+
+
+def chip_colors(t):
+    tl = t.lower()
+    if "навсегда" in tl or "аккаунт" in tl:
+        return "#2a0d12", "#6b1f2b", "#ff8a9a"
+    if "чат" in tl or "репорт" in tl or "голос" in tl:
+        return "#1c1c1f", "#33333a", "#cfcfd6"
+    return "#2a1606", "#6b3a0f", "#ffb066"
+
+
+def split_notes(notes):
+    exc, other = [], []
+    for n in notes:
+        m = re.match(r"^Исключени[ея]\s*:\s*(.*)$", n)
+        if m:
+            exc += [x.strip().rstrip(".") for x in m.group(1).split(";") if x.strip()]
+        else:
+            other.append(n)
+    return exc, other
+
+
+def chip_label(text, wrap=False):
+    bg, br, fg = chip_colors(text)
+    lab = QLabel(text)
+    lab.setWordWrap(wrap)
+    lab.setStyleSheet(f"background:{bg}; border:1px solid {br}; color:{fg}; border-radius:8px; padding:4px 10px; font-size:12px; font-weight:600;")
+    return lab
+
+
 STYLE = """
-* { font-family: 'Segoe UI', Arial; color: #f2f2f2; }
-QWidget#root, QDialog { background: #080808; }
-QLabel#title { font-size: 20px; font-weight: 700; }
-QLabel#sub { color: #8a8a8a; font-size: 12px; }
-QLineEdit { background: #171717; border: 1px solid #262626; border-radius: 12px; padding: 10px 14px; font-size: 14px; }
-QLineEdit:focus { border: 1px solid #ff7a00; }
-QListWidget { background: #0f0f0f; border: none; border-radius: 12px; padding: 6px; font-size: 13px; outline: 0; }
-QListWidget::item { padding: 10px 12px; border-radius: 8px; }
-QListWidget::item:selected { background: #ff7a00; color: #080808; }
-QListWidget::item:hover:!selected { background: #1d1d1d; }
-QPushButton { background: #f2f2f2; color: #080808; border: none; border-radius: 12px; padding: 9px 16px; font-weight: 600; }
-QPushButton:hover { background: #ffffff; }
-QPushButton#orange { background: #ff7a00; }
+* { font-family: 'Segoe UI', 'Segoe UI Symbol', 'Segoe UI Emoji', Arial; color: #f2f2f2; }
+QFrame#panel { background: #0d0d0e; border: 1px solid #232325; border-radius: 20px; }
+QFrame#line { background: #1f1f22; }
+QLineEdit#search { background: transparent; border: none; font-size: 20px; font-weight: 600; padding: 4px 6px; selection-background-color: #ff7a00; }
+QPushButton#icon { background: #171719; border: 1px solid #262629; border-radius: 12px; padding: 0; min-width: 38px; max-width: 38px; min-height: 38px; max-height: 38px; font-size: 17px; }
+QPushButton#icon:hover { background: #222226; }
+QPushButton#icon:checked { background: #2a1606; border: 1px solid #ff7a00; color: #ff8a1f; }
+QFrame#seg { background: #151517; border: 1px solid #232325; border-radius: 16px; }
+QPushButton#tab { background: transparent; border: none; color: #77777d; font-weight: 600; padding: 7px 16px; border-radius: 13px; }
+QPushButton#tab:checked { background: #26262a; color: #ffffff; }
+QPushButton#copy { background: #171719; border: 1px solid #262629; border-radius: 10px; padding: 6px 12px; font-size: 12px; }
+QPushButton#copy:hover { background: #222226; }
+QPushButton#star { background: transparent; border: none; font-size: 20px; padding: 0 6px; color: #ff8a1f; }
+QPushButton#orange { background: #ff7a00; color: #080808; border: none; border-radius: 12px; padding: 9px 16px; font-weight: 600; }
 QPushButton#orange:hover { background: #ff8f26; }
-QFrame#card { background: #171717; border: 1px solid #222; border-radius: 14px; }
-QLabel#badge { background: #ff7a00; color: #080808; border-radius: 8px; padding: 3px 10px; font-weight: 700; }
-QLabel#ctext { font-size: 14px; }
-QLabel#pun { background: #241505; border-left: 3px solid #ff7a00; border-radius: 6px; padding: 8px 10px; color: #ffb066; font-weight: 600; }
-QLabel#note { color: #9a9a9a; font-size: 12px; }
-QLabel#head { color: #ff7a00; font-size: 15px; font-weight: 700; padding: 8px 2px 0 2px; }
-QLabel#empty { color: #777; font-size: 14px; padding: 30px; }
+QPushButton#plain { background: #f2f2f2; color: #080808; border: none; border-radius: 12px; padding: 9px 16px; font-weight: 600; }
+QPushButton#danger { background: #3a1016; color: #ff8a9a; border: 1px solid #6b1f2b; border-radius: 12px; padding: 9px 16px; font-weight: 600; }
+QLabel#rid { color: #ff7a00; font-size: 12px; font-weight: 700; }
+QLabel#tag { color: #666; font-size: 11px; }
+QLabel#rtext { color: #cfcfd2; font-size: 13px; }
+QLabel#did { color: #ff7a00; font-size: 22px; font-weight: 700; }
+QLabel#dsec { color: #77777d; font-size: 13px; }
+QLabel#dtext { font-size: 16px; }
+QLabel#more { background: #1a1a1d; border-radius: 6px; padding: 3px 7px; color: #8a8a90; font-size: 11px; }
+QFrame#block { background: #141416; border-radius: 14px; }
+QLabel#bhead { color: #8a8a90; font-size: 13px; }
+QLabel#ghead { color: #4cd37b; font-size: 13px; font-weight: 700; }
+QLabel#bitem { color: #a6a6ac; font-size: 13px; }
+QLabel#empty { color: #6c6c72; font-size: 14px; padding: 30px; }
+QLabel#result { color: #ffb066; font-size: 20px; font-weight: 700; padding: 10px 0; }
 QScrollArea { border: none; background: transparent; }
 QScrollBar:vertical { background: transparent; width: 8px; }
-QScrollBar::handle:vertical { background: #333; border-radius: 4px; min-height: 30px; }
+QScrollBar::handle:vertical { background: #2c2c30; border-radius: 4px; min-height: 30px; }
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
-QComboBox { background: #171717; border: 1px solid #262626; border-radius: 10px; padding: 6px 10px; }
-QComboBox QAbstractItemView { background: #171717; selection-background-color: #ff7a00; }
-QSlider::groove:horizontal { background: #262626; height: 6px; border-radius: 3px; }
+QDialog { background: #0d0d0e; }
+QLineEdit { background: #171719; border: 1px solid #262629; border-radius: 10px; padding: 8px 12px; selection-background-color: #ff7a00; }
+QComboBox { background: #171719; border: 1px solid #262629; border-radius: 10px; padding: 6px 10px; }
+QComboBox QAbstractItemView { background: #171719; selection-background-color: #ff7a00; }
+QListWidget { background: #141416; border: 1px solid #262629; border-radius: 10px; padding: 4px; outline: 0; }
+QListWidget::item { padding: 7px 8px; border-radius: 6px; }
+QListWidget::item:selected { background: #ff7a00; color: #080808; }
+QTabWidget::pane { border: none; }
+QTabBar::tab { background: #171719; padding: 8px 18px; border-radius: 10px; margin-right: 6px; }
+QTabBar::tab:selected { background: #ff7a00; color: #080808; }
+QSlider::groove:horizontal { background: #262629; height: 6px; border-radius: 3px; }
 QSlider::handle:horizontal { background: #ff7a00; width: 16px; margin: -6px 0; border-radius: 8px; }
 QSlider::sub-page:horizontal { background: #ff7a00; border-radius: 3px; }
 """
 
 
-class Card(QFrame):
-    def __init__(self, item):
+def build_style(scale_idx):
+    f = SCALES[scale_idx] if 0 <= scale_idx < len(SCALES) else 1.0
+    return re.sub(r"font-size:\s*(\d+)px", lambda m: f"font-size: {round(int(m.group(1)) * f)}px", STYLE)
+
+
+def fav_key(tab, art_id):
+    return f"{tab}:{art_id}"
+
+
+class DragBar(QWidget):
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton and self.window().windowHandle():
+            self.window().windowHandle().startSystemMove()
+
+
+class ResultRow(QFrame):
+    def __init__(self, section, item, toks, fav, on_click):
         super().__init__()
-        self.setObjectName("card")
+        self.item, self.section, self.on_click = item, section, on_click
+        self.setObjectName("row")
+        self.setCursor(Qt.PointingHandCursor)
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(16, 14, 16, 14)
-        lay.setSpacing(8)
+        lay.setContentsMargins(14, 10, 14, 10)
+        lay.setSpacing(5)
         top = QHBoxLayout()
-        badge = QLabel(f"Ст. {item['id']}")
-        badge.setObjectName("badge")
-        top.addWidget(badge)
+        rid = QLabel(item["id"])
+        rid.setObjectName("rid")
+        tag = QLabel(("★ " if fav else "") + section.get("short", section["title"]))
+        tag.setObjectName("tag")
+        top.addWidget(rid)
         top.addStretch()
+        top.addWidget(tag)
         lay.addLayout(top)
-        text = QLabel(item["text"])
-        text.setObjectName("ctext")
-        text.setWordWrap(True)
-        text.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        lay.addWidget(text)
-        if item.get("punishment"):
-            pun = QLabel(item["punishment"])
-            pun.setObjectName("pun")
-            pun.setWordWrap(True)
-            pun.setTextInteractionFlags(Qt.TextSelectableByMouse)
-            lay.addWidget(pun)
-        for n in item.get("notes", []):
-            note = QLabel(n)
-            note.setObjectName("note")
-            note.setWordWrap(True)
-            note.setTextInteractionFlags(Qt.TextSelectableByMouse)
-            lay.addWidget(note)
+        txt = item["text"]
+        if len(txt) > 110:
+            txt = txt[:110].rstrip() + "…"
+        lab = QLabel(highlight(txt, toks))
+        lab.setTextFormat(Qt.RichText)
+        lab.setObjectName("rtext")
+        lab.setWordWrap(True)
+        lay.addWidget(lab)
+        chips = punish_chips(item.get("punishment"))
+        if chips:
+            row = QHBoxLayout()
+            first = chips[0] if len(chips[0]) <= 34 else chips[0][:33] + "…"
+            c = chip_label(first)
+            c.setStyleSheet(c.styleSheet().replace("padding:4px 10px", "padding:2px 8px").replace("font-size:12px", "font-size:11px"))
+            row.addWidget(c)
+            if len(chips) > 1:
+                m = QLabel(f"+{len(chips) - 1}")
+                m.setObjectName("more")
+                row.addWidget(m)
+            row.addStretch()
+            lay.addLayout(row)
+        self.set_selected(False)
+
+    def set_selected(self, sel):
+        self.setStyleSheet("QFrame#row { background: %s; border-radius: 12px; }" % ("#1a1a1d" if sel else "transparent"))
+
+    def mousePressEvent(self, e):
+        self.on_click(self)
 
 
 class SettingsDialog(QDialog):
-    def __init__(self, parent, settings, on_update, on_rollback):
+    def __init__(self, parent, settings):
         super().__init__(parent)
         self.setWindowTitle("Настройки")
-        self.setMinimumWidth(420)
+        self.setMinimumWidth(380)
         self.s = settings
         lay = QVBoxLayout(self)
         lay.setSpacing(10)
-
-        lay.addWidget(QLabel("Клавиша открытия/скрытия:"))
+        lay.addWidget(QLabel("Клавиша открытия и скрытия"))
         self.hk = QComboBox()
         self.hk.addItems([h.upper() for h in HOTKEYS])
         self.hk.setCurrentText(settings["hotkey"].upper())
         lay.addWidget(self.hk)
-
-        lay.addWidget(QLabel("Прозрачность окна:"))
+        lay.addWidget(QLabel("Прозрачность окна"))
         self.op = QSlider(Qt.Horizontal)
         self.op.setRange(40, 100)
         self.op.setValue(settings["opacity"])
         lay.addWidget(self.op)
-
+        lay.addWidget(QLabel("Размер текста"))
+        self.sc = QComboBox()
+        self.sc.addItems(["Мелкий", "Обычный", "Крупный"])
+        self.sc.setCurrentIndex(settings["scale"])
+        lay.addWidget(self.sc)
         self.top = QCheckBox("Поверх всех окон")
         self.top.setChecked(settings["on_top"])
         lay.addWidget(self.top)
-
-        lay.addWidget(QLabel("Ссылка на JSON с базой (для обновления):"))
-        self.url = QLineEdit(settings["update_url"])
-        self.url.setPlaceholderText("https://example.com/laws.json")
-        lay.addWidget(self.url)
-
-        row = QHBoxLayout()
-        b_up = QPushButton("Обновить базу")
-        b_up.setObjectName("orange")
-        b_up.clicked.connect(lambda: (self.apply(), on_update()))
-        b_rb = QPushButton("Откатить базу")
-        b_rb.clicked.connect(on_rollback)
-        row.addWidget(b_up)
-        row.addWidget(b_rb)
-        lay.addLayout(row)
-
         b_ok = QPushButton("Сохранить")
         b_ok.setObjectName("orange")
         b_ok.clicked.connect(lambda: (self.apply(), self.accept()))
         lay.addWidget(b_ok)
+        b_quit = QPushButton("Закрыть программу")
+        b_quit.setObjectName("plain")
+        b_quit.clicked.connect(QApplication.quit)
+        lay.addWidget(b_quit)
 
     def apply(self):
         self.s["hotkey"] = self.hk.currentText().lower()
         self.s["opacity"] = self.op.value()
         self.s["on_top"] = self.top.isChecked()
-        self.s["update_url"] = self.url.text().strip()
+        self.s["scale"] = self.sc.currentIndex()
         save_settings(self.s)
+        QApplication.instance().setStyleSheet(build_style(self.s["scale"]))
         self.parent().apply_window_settings()
 
 
 class Bridge(QObject):
     toggle = Signal()
+    updated = Signal(object)
+    failed = Signal(str)
 
 
 class MainWindow(QWidget):
     def __init__(self, settings, bridge):
         super().__init__()
-        self.setObjectName("root")
         self.settings = settings
-        self.db = load_json(DB_FILE, {"version": "?", "sections": []})
+        self.bridge = bridge
+        self.db = load_json(DB_FILE, {"version": "?", "sections": [], "laws": []})
+        self.tab = "sections"
+        self.rows = []
+        self.fav_mode = False
         self.setWindowTitle(APP_NAME)
         self.setWindowIcon(QIcon(str(res("icon.png"))))
-        self.resize(1000, 700)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.resize(1080, 660)
         bridge.toggle.connect(self.toggle_visible)
+        bridge.updated.connect(self.on_updated)
+        bridge.failed.connect(lambda m: QMessageBox.warning(self, APP_NAME, f"Не удалось обновить базу:\n{m}"))
 
-        root = QVBoxLayout(self)
-        root.setContentsMargins(20, 16, 20, 16)
-        root.setSpacing(12)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(8, 8, 8, 8)
+        panel = QFrame()
+        panel.setObjectName("panel")
+        outer.addWidget(panel)
+        root = QVBoxLayout(panel)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
 
-        head = QHBoxLayout()
+        bar = DragBar()
+        head = QHBoxLayout(bar)
+        head.setContentsMargins(18, 14, 18, 14)
+        head.setSpacing(8)
         logo = QLabel()
-        logo.setPixmap(QIcon(str(res("icon.png"))).pixmap(40, 40))
+        logo.setPixmap(QIcon(str(res("icon.png"))).pixmap(34, 34))
         head.addWidget(logo)
-        col = QVBoxLayout()
-        col.setSpacing(0)
-        t = QLabel(APP_NAME)
-        t.setObjectName("title")
-        self.sub = QLabel()
-        self.sub.setObjectName("sub")
-        col.addWidget(t)
-        col.addWidget(self.sub)
-        head.addLayout(col)
-        head.addStretch()
-        b_set = QPushButton("Настройки")
-        b_set.clicked.connect(self.open_settings)
-        head.addWidget(b_set)
-        root.addLayout(head)
+        self.search = QLineEdit()
+        self.search.setObjectName("search")
+        self.search.setPlaceholderText("Что мне будет за убийство игрока?")
+        self.search.textChanged.connect(self.refresh)
+        head.addWidget(self.search, 1)
+        seg = QFrame()
+        seg.setObjectName("seg")
+        sl = QHBoxLayout(seg)
+        sl.setContentsMargins(3, 3, 3, 3)
+        sl.setSpacing(0)
+        self.b_rules = QPushButton("Правила")
+        self.b_laws = QPushButton("Законы")
+        for b, key in ((self.b_rules, "sections"), (self.b_laws, "laws")):
+            b.setObjectName("tab")
+            b.setCheckable(True)
+            b.clicked.connect(lambda _=False, k=key: self.set_tab(k))
+            sl.addWidget(b)
+        self.b_rules.setChecked(True)
+        head.addWidget(seg)
+
+        self.b_fav = self.icon_btn("★", "Избранное", head, checkable=True)
+        self.b_fav.clicked.connect(self.toggle_fav_mode)
+        self.icon_btn("↻", "Обновить базу", head).clicked.connect(lambda: self.do_update(False))
+        self.icon_btn("⚙", "Настройки", head).clicked.connect(lambda: SettingsDialog(self, self.settings).exec())
+        self.icon_btn("–", "Скрыть", head).clicked.connect(self.hide)
+        root.addWidget(bar)
+
+        line = QFrame()
+        line.setObjectName("line")
+        line.setFixedHeight(1)
+        root.addWidget(line)
 
         body = QHBoxLayout()
-        body.setSpacing(14)
-        self.secs = QListWidget()
-        self.secs.setFixedWidth(250)
-        body.addWidget(self.secs)
+        body.setContentsMargins(0, 0, 0, 0)
+        body.setSpacing(0)
+        self.left = QScrollArea()
+        self.left.setWidgetResizable(True)
+        self.left.setFixedWidth(400)
+        self.left_w = QWidget()
+        self.left_w.setStyleSheet("background: transparent;")
+        self.left_l = QVBoxLayout(self.left_w)
+        self.left_l.setContentsMargins(10, 10, 6, 10)
+        self.left_l.setSpacing(2)
+        self.left.setWidget(self.left_w)
+        body.addWidget(self.left)
+        vline = QFrame()
+        vline.setObjectName("line")
+        vline.setFixedWidth(1)
+        body.addWidget(vline)
+        self.right = QScrollArea()
+        self.right.setWidgetResizable(True)
+        self.right_w = QWidget()
+        self.right_w.setStyleSheet("background: transparent;")
+        self.right_l = QVBoxLayout(self.right_w)
+        self.right_l.setContentsMargins(26, 22, 26, 22)
+        self.right_l.setSpacing(14)
+        self.right.setWidget(self.right_w)
+        body.addWidget(self.right, 1)
+        root.addLayout(body, 1)
 
-        right = QVBoxLayout()
-        self.search = QLineEdit()
-        self.search.setPlaceholderText("Поиск: номер статьи, слово, наказание (например: DM, 4.1, деморган)")
-        self.search.textChanged.connect(self.refresh)
-        right.addWidget(self.search)
-        self.scroll = QScrollArea()
-        self.scroll.setWidgetResizable(True)
-        self.holder = QWidget()
-        self.holder.setStyleSheet("background: transparent;")
-        self.vbox = QVBoxLayout(self.holder)
-        self.vbox.setSpacing(10)
-        self.vbox.setContentsMargins(0, 0, 8, 0)
-        self.scroll.setWidget(self.holder)
-        right.addWidget(self.scroll)
-        body.addLayout(right)
-        root.addLayout(body)
+        foot = QHBoxLayout()
+        foot.setContentsMargins(18, 0, 10, 6)
+        self.status = QLabel()
+        self.status.setObjectName("tag")
+        foot.addWidget(self.status)
+        foot.addStretch()
+        foot.addWidget(QSizeGrip(self))
+        root.addLayout(foot)
 
-        self.fill_sections()
-        self.secs.currentRowChanged.connect(self.refresh)
         self.apply_window_settings()
+        self.refresh()
+        if self.settings.get("update_url") or UPDATE_URL:
+            QTimer.singleShot(1500, lambda: self.do_update(True))
 
-    def fill_sections(self):
-        self.secs.blockSignals(True)
-        self.secs.clear()
-        self.secs.addItem("Все разделы")
-        for s in self.db["sections"]:
-            self.secs.addItem(f"{s['id']}. {s['title']}")
-        self.secs.setCurrentRow(0)
-        self.secs.blockSignals(False)
-        total = sum(len(s["items"]) for s in self.db["sections"])
-        self.sub.setText(f"Юридическая база  ·  версия {self.db.get('version', '?')}  ·  статей: {total}")
+    def icon_btn(self, glyph, tip, layout, checkable=False):
+        b = QPushButton(glyph)
+        b.setObjectName("icon")
+        b.setToolTip(tip)
+        b.setCheckable(checkable)
+        layout.addWidget(b)
+        return b
+
+    # ----- данные -----
+    def sections(self):
+        return self.db.get(self.tab, [])
+
+    def set_tab(self, key):
+        self.tab = key
+        self.fav_mode = False
+        self.sync_buttons()
         self.refresh()
 
+    def toggle_fav_mode(self):
+        self.fav_mode = self.b_fav.isChecked()
+        self.sync_buttons()
+        self.refresh()
+
+    def sync_buttons(self):
+        self.b_fav.setChecked(self.fav_mode)
+        self.b_rules.setChecked(not self.fav_mode and self.tab == "sections")
+        self.b_laws.setChecked(not self.fav_mode and self.tab == "laws")
+
+    def clear(self, layout):
+        while layout.count():
+            it = layout.takeAt(0)
+            if it.widget():
+                it.widget().deleteLater()
+
+    def update_status(self):
+        if self.fav_mode:
+            fav = self.settings.get("fav", [])
+            self.status.setText(f"{APP_NAME}  ·  избранное: {len(fav)}")
+            return
+        total = sum(len(s["items"]) for s in self.sections())
+        self.status.setText(f"{APP_NAME}  ·  версия базы {self.db.get('version', '?')}  ·  записей: {total}")
+
+    def flash(self, msg):
+        self.status.setText(msg)
+        QTimer.singleShot(3000, self.update_status)
+
+    def collect(self):
+        q = self.search.text()
+        if not self.fav_mode:
+            return [(self.tab, s, it) for s, it in search(self.sections(), q)]
+        fav = set(self.settings.get("fav", []))
+        out = []
+        for tab in ("sections", "laws"):
+            for s, it in search(self.db.get(tab, []), q):
+                if fav_key(tab, it["id"]) in fav:
+                    out.append((tab, s, it))
+        return out
+
     def refresh(self):
-        while self.vbox.count():
-            w = self.vbox.takeAt(0).widget()
-            if w:
-                w.deleteLater()
-        q = self.search.text().lower().strip()
-        row = self.secs.currentRow()
-        found = 0
-        for i, s in enumerate(self.db["sections"], start=1):
-            if row > 0 and i != row:
-                continue
-            cards = []
-            for it in s["items"]:
-                hay = " ".join([it["id"], it["text"], it.get("punishment", ""), *it.get("notes", [])]).lower()
-                if q in hay:
-                    cards.append(it)
-            if not cards:
-                continue
-            if row <= 0:
-                h = QLabel(f"{s['id']}. {s['title']}")
-                h.setObjectName("head")
-                self.vbox.addWidget(h)
-            for it in cards:
-                self.vbox.addWidget(Card(it))
-                found += 1
-        if not found:
-            e = QLabel("Ничего не найдено")
+        self.clear(self.left_l)
+        self.rows = []
+        toks = tokens(self.search.text())
+        results = self.collect()
+        fav = set(self.settings.get("fav", []))
+        self.update_status()
+        if not results:
+            if self.fav_mode:
+                msg = "В избранном пока пусто. Откройте статью и нажмите ☆"
+            elif self.sections():
+                msg = "Ничего не найдено"
+            else:
+                msg = "Раздел пока пуст"
+            e = QLabel(msg)
             e.setObjectName("empty")
             e.setAlignment(Qt.AlignCenter)
-            self.vbox.addWidget(e)
-        self.vbox.addStretch()
+            e.setWordWrap(True)
+            self.left_l.addWidget(e)
+            self.show_detail(None, None, None)
+        else:
+            for tab, s, it in results:
+                row = ResultRow(s, it, toks, fav_key(tab, it["id"]) in fav, self.select_row)
+                row.tab = tab
+                self.rows.append(row)
+                self.left_l.addWidget(row)
+            self.select_row(self.rows[0])
+        self.left_l.addStretch()
 
+    def select_row(self, row):
+        for r in self.rows:
+            r.set_selected(r is row)
+        self.show_detail(row.tab, row.section, row.item)
+
+    def toggle_fav(self, tab, art_id):
+        fav = self.settings.setdefault("fav", [])
+        k = fav_key(tab, art_id)
+        if k in fav:
+            fav.remove(k)
+        else:
+            fav.append(k)
+        save_settings(self.settings)
+        self.refresh()
+        for r in self.rows:
+            if r.item["id"] == art_id and r.tab == tab:
+                self.select_row(r)
+                break
+
+    def show_detail(self, tab, section, item):
+        self.clear(self.right_l)
+        if item is None:
+            return
+        toks = tokens(self.search.text())
+        head = QWidget()
+        hl = QHBoxLayout(head)
+        hl.setContentsMargins(0, 0, 0, 0)
+        did = QLabel(item["id"])
+        did.setObjectName("did")
+        dsec = QLabel(section["title"])
+        dsec.setObjectName("dsec")
+        hl.addWidget(did)
+        hl.addWidget(dsec)
+        hl.addStretch()
+        is_fav = fav_key(tab, item["id"]) in self.settings.get("fav", [])
+        b_star = QPushButton("★" if is_fav else "☆")
+        b_star.setObjectName("star")
+        b_star.setToolTip("В избранное")
+        b_star.clicked.connect(lambda: self.toggle_fav(tab, item["id"]))
+        hl.addWidget(b_star)
+        b_copy = QPushButton("Копировать")
+        b_copy.setObjectName("copy")
+        b_copy.clicked.connect(lambda: self.copy_item(b_copy, item))
+        hl.addWidget(b_copy)
+        self.right_l.addWidget(head)
+
+        t = QLabel(highlight(item["text"], toks))
+        t.setTextFormat(Qt.RichText)
+        t.setObjectName("dtext")
+        t.setWordWrap(True)
+        t.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.right_l.addWidget(t)
+
+        chips = punish_chips(item.get("punishment"))
+        if chips:
+            blk = QFrame()
+            blk.setObjectName("block")
+            bl = QVBoxLayout(blk)
+            bl.setContentsMargins(16, 14, 16, 16)
+            bl.setSpacing(10)
+            h = QLabel("Наказание")
+            h.setObjectName("bhead")
+            bl.addWidget(h)
+            for c in chips:
+                row = QHBoxLayout()
+                row.addWidget(chip_label(c, wrap=True))
+                row.addStretch()
+                bl.addLayout(row)
+            self.right_l.addWidget(blk)
+
+        exc, other = split_notes(item.get("notes", []))
+        if exc:
+            self.right_l.addWidget(self.list_block("Исключения", exc, "ghead", "•"))
+        if other:
+            self.right_l.addWidget(self.list_block("Примечания", other, "bhead", ""))
+        self.right_l.addStretch()
+
+    def list_block(self, title, lines, head_obj, bullet):
+        blk = QFrame()
+        blk.setObjectName("block")
+        bl = QVBoxLayout(blk)
+        bl.setContentsMargins(16, 14, 16, 14)
+        bl.setSpacing(8)
+        h = QLabel(title)
+        h.setObjectName(head_obj)
+        bl.addWidget(h)
+        for ln in lines:
+            lab = QLabel((bullet + "  " if bullet else "") + ln)
+            lab.setObjectName("bitem")
+            lab.setWordWrap(True)
+            lab.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            bl.addWidget(lab)
+        return blk
+
+    def copy_item(self, btn, item):
+        text = f"Ст. {item['id']}: {item['text']}"
+        if item.get("punishment"):
+            text += f"\nНаказание: {item['punishment']}"
+        QApplication.clipboard().setText(text)
+        btn.setText("Скопировано")
+        QTimer.singleShot(1200, lambda: btn.setText("Копировать"))
+
+    # ----- обновление и админка -----
+    def do_update(self, silent):
+        url = self.settings.get("update_url") or UPDATE_URL
+        if not url:
+            if not silent:
+                QMessageBox.information(self, APP_NAME, "Администратор ещё не указал ссылку для обновления.")
+            return
+        if not silent:
+            self.flash("Проверяю обновления…")
+
+        def work():
+            try:
+                self.bridge.updated.emit((fetch_remote(url), silent))
+            except Exception as e:
+                if not silent:
+                    self.bridge.failed.emit(str(e))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_updated(self, payload):
+        data, silent = payload
+        if ver_tuple(data["version"]) <= ver_tuple(self.db.get("version", "0")):
+            if not silent:
+                self.flash("База актуальна")
+            return
+        if DB_FILE.exists():
+            shutil.copy(DB_FILE, BACKUP_FILE)
+        write_db(data)
+        self.db.clear()
+        self.db.update(data)
+        self.refresh()
+        self.flash(f"База обновлена до версии {data['version']}")
+
+    # ----- окно -----
     def apply_window_settings(self):
         vis = self.isVisible()
-        self.setWindowFlag(Qt.WindowStaysOnTopHint, bool(self.settings["on_top"]))
+        flags = Qt.Window | Qt.FramelessWindowHint
+        if self.settings["on_top"]:
+            flags |= Qt.WindowStaysOnTopHint
+        self.setWindowFlags(flags)
         self.setWindowOpacity(self.settings["opacity"] / 100)
         if vis:
             self.show()
@@ -329,30 +688,14 @@ class MainWindow(QWidget):
             self.showNormal()
             self.raise_()
             self.activateWindow()
+            self.search.setFocus()
+            self.search.selectAll()
 
-    def open_settings(self):
-        SettingsDialog(self, self.settings, self.do_update, self.do_rollback).exec()
-
-    def do_update(self):
-        url = self.settings["update_url"]
-        if not url:
-            QMessageBox.information(self, APP_NAME, "Сначала укажите ссылку на JSON с базой.")
-            return
-        try:
-            self.db = update_from_url(url)
-            self.fill_sections()
-            QMessageBox.information(self, APP_NAME, f"База обновлена до версии {self.db['version']}.")
-        except Exception as e:
-            QMessageBox.warning(self, APP_NAME, f"Не удалось обновить базу:\n{e}\n\nСтарая база сохранена.")
-
-    def do_rollback(self):
-        if not BACKUP_FILE.exists():
-            QMessageBox.information(self, APP_NAME, "Резервной копии пока нет.")
-            return
-        shutil.copy(BACKUP_FILE, DB_FILE)
-        self.db = load_json(DB_FILE, self.db)
-        self.fill_sections()
-        QMessageBox.information(self, APP_NAME, "База откачена к предыдущей версии.")
+    def keyPressEvent(self, e):
+        if e.key() == Qt.Key_Escape:
+            self.hide()
+        else:
+            super().keyPressEvent(e)
 
 
 def start_hotkey_listener(settings, bridge):
@@ -372,7 +715,7 @@ def start_hotkey_listener(settings, bridge):
 def main():
     settings = prepare_data()
     app = QApplication(sys.argv)
-    app.setStyleSheet(STYLE)
+    app.setStyleSheet(build_style(settings["scale"]))
     app.setWindowIcon(QIcon(str(res("icon.png"))))
     bridge = Bridge()
     win = MainWindow(settings, bridge)
