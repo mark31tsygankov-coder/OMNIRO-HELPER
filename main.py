@@ -17,6 +17,9 @@ from PySide6.QtWidgets import (
     QVBoxLayout, QWidget,
 )
 
+import licensing
+from admin_panel import AdminPanel, LoginDialog, SecretLabel
+
 APP_NAME = "OMNIRO ONLANE"
 
 # ===== НАСТРОЙКИ ВЛАДЕЛЬЦА (меняйте перед сборкой) =====
@@ -30,6 +33,7 @@ DATA_DIR = Path(os.getenv("APPDATA", str(Path.home()))) / APP_NAME
 SETTINGS_FILE = DATA_DIR / "settings.json"
 DB_FILE = DATA_DIR / "laws.json"
 BACKUP_FILE = DATA_DIR / "laws.backup.json"
+LICENSE_FILE = DATA_DIR / "license.json"
 DEFAULTS = {"hotkey": "home", "opacity": 96, "on_top": True, "update_url": "", "scale": 1, "fav": []}
 
 STOP = set("что чем мне мой моя меня будет быть за на в во и или а как по при с со у к от до для не это то ли же бы если можно нельзя".split())
@@ -335,6 +339,99 @@ class SettingsDialog(QDialog):
         self.parent().apply_window_settings()
 
 
+class ActivationDialog(QDialog):
+    def __init__(self, store, message=""):
+        super().__init__()
+        self.store = store
+        self.hwid = licensing.get_hwid()
+        self.setWindowTitle(APP_NAME)
+        self.setWindowIcon(QIcon(str(res("icon.png"))))
+        self.setFixedWidth(380)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(20, 20, 20, 20)
+        lay.setSpacing(10)
+        title = SecretLabel("⚡ " + APP_NAME)
+        title.setStyleSheet("font-size: 20px; font-weight: bold; color: #ff7a00;")
+        title.triggered.connect(self.open_admin_panel)
+        lay.addWidget(title)
+        lay.addWidget(QLabel("ID вашего устройства (отправьте его администратору):"))
+        row = QHBoxLayout()
+        idl = QLabel(self.hwid)
+        idl.setStyleSheet("font-size: 16px; font-weight: bold;")
+        idl.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        b_copy = QPushButton("Копировать")
+        b_copy.clicked.connect(lambda: QApplication.clipboard().setText(self.hwid))
+        row.addWidget(idl, 1)
+        row.addWidget(b_copy)
+        lay.addLayout(row)
+        lay.addWidget(QLabel("Ключ активации"))
+        self.edit = QLineEdit()
+        self.edit.setPlaceholderText("Вставьте ключ OMNI-…")
+        self.edit.returnPressed.connect(self.activate)
+        lay.addWidget(self.edit)
+        self.msg = QLabel(message)
+        self.msg.setWordWrap(True)
+        self.msg.setStyleSheet("color: #ff5555;")
+        lay.addWidget(self.msg)
+        self.btn = QPushButton("Активировать")
+        self.btn.clicked.connect(self.activate)
+        lay.addWidget(self.btn)
+
+    def open_admin_panel(self):
+        key = open_admin(self)
+        if key:  # админ создал ключ для этого ПК - сразу активируем
+            self.edit.setText(key)
+            self.activate()
+
+    def activate(self):
+        key = "".join(self.edit.text().split())
+        if not key:
+            return
+        r = licensing.verify(key)
+        if r["ok"] and not self.store.clock_ok():
+            r = {"ok": False, "error": "Системное время изменено. Верните правильное время."}
+        if r["ok"]:
+            self.store.touch(key)
+            self.accept()
+        else:
+            self.msg.setText(r["error"])
+
+
+def open_admin(parent=None):
+    """Секретный вход админа. Возвращает ключ для этого ПК, если админ его создал."""
+    login = LoginDialog(parent)
+    if login.exec() != QDialog.Accepted or login.priv is None:
+        return None
+    panel = AdminPanel(login.priv, DATA_DIR, parent)
+    panel.exec()
+    return panel.own_key
+
+
+def ensure_license():
+    """True, если можно запускать программу."""
+    store = licensing.Store(LICENSE_FILE)
+    r = licensing.check_saved(store)
+    if r["ok"]:
+        return True
+    return ActivationDialog(store, r["error"]).exec() == QDialog.Accepted
+
+
+def watch_license():
+    """Раз в 5 минут проверяет срок ключа (истёк -> программа закрывается)."""
+    store = licensing.Store(LICENSE_FILE)
+
+    def tick():
+        r = licensing.check_saved(store)
+        if not r["ok"]:
+            QMessageBox.warning(None, APP_NAME, f"Ключ больше не действует.\n{r['error']}")
+            QApplication.quit()
+
+    timer = QTimer()
+    timer.timeout.connect(tick)
+    timer.start(5 * 60 * 1000)
+    return timer
+
+
 class Bridge(QObject):
     toggle = Signal()
     updated = Signal(object)
@@ -371,8 +468,9 @@ class MainWindow(QWidget):
         head = QHBoxLayout(bar)
         head.setContentsMargins(18, 14, 18, 14)
         head.setSpacing(8)
-        logo = QLabel()
+        logo = SecretLabel()
         logo.setPixmap(QIcon(str(res("icon.png"))).pixmap(34, 34))
+        logo.triggered.connect(lambda: open_admin(self))
         head.addWidget(logo)
         self.search = QLineEdit()
         self.search.setObjectName("search")
@@ -717,6 +815,9 @@ def main():
     app = QApplication(sys.argv)
     app.setStyleSheet(build_style(settings["scale"]))
     app.setWindowIcon(QIcon(str(res("icon.png"))))
+    if not ensure_license():
+        sys.exit(0)
+    license_timer = watch_license()  # noqa: F841 (держим ссылку)
     bridge = Bridge()
     win = MainWindow(settings, bridge)
     win.show()
